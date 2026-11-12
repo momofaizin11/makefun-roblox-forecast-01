@@ -1,252 +1,360 @@
 #!/usr/bin/env python3
-"""Forecast Roblox's Up-and-Coming top 10 for the 72 hours after the deadline.
+"""Forecast Roblox's "Up and Coming" chart (top 10) for the 72 hours after the deadline.
 
-Reads /input/task.json and /input/history.ndjson (or $MAKEFUN_INPUT_DIR), writes
-forecast.json to /output (or $MAKEFUN_OUTPUT_DIR). Standard library only, no network,
-deterministic: the same history always produces the same bytes.
+Reads MAKEFUN_INPUT_DIR (default /input) for task.json + history.ndjson and writes
+MAKEFUN_OUTPUT_DIR/forecast.json (default /output/forecast.json).
 
-The model: a rank-diffusion kernel around each game's place when the history ends,
-widened by the forecast horizon, times a few per-game factors (player growth, size,
-age, presence on the other charts), renormalised at every place and multiplied by a
-decay that leaves room for the games that will join the chart later.
+Deterministic: no network, no wall clock, no randomness.
 """
+
 import json
 import math
 import os
 import sys
 from datetime import datetime, timezone
 
-PLACES = 10
-SLOTS = 72
-HORIZON = 72 * 3600.0
-
-# fitted on the public archive: kernel + per-game factors, decay per horizon
-PARAMS = {
-    "cand": 25,
-    "s0": 3.5, "s1": 4.0,      # spread = s0 + s1 * sqrt(h / 72h)
-    "st0": 1.0, "st1": 0.0,    # extra weight on a game that holds the place now
-    "d0": 0.8, "d1": -0.05,    # decay = share of a place named, rest left unnamed
-    "w_growth": 0.2, "w_logplay": 0.2, "w_age": -0.4, "w_other": -0.3,
-}
+HORIZON = 259200.0        # 3 days in seconds (u saturates here)
+CANDIDATES = 25           # games considered from the last read's chart
+AGE_DEFAULT = 30.0        # days, when created is unknown
+AGE_CAP = 60.0
+GROWTH_LOOKBACK = 6       # reads searched for the growth pair
+MAX_ROWS_PER_PLACE = 100
 
 
-def parse_ts(text):
+def parse_ts(value):
+    """ISO-8601 (with Z or offset) -> aware UTC datetime, or None."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
     if not text:
         return None
-    t = text.strip().replace("Z", "+00:00")
+    if text.endswith("Z") or text.endswith("z"):
+        text = text[:-1] + "+00:00"
     try:
-        return datetime.fromisoformat(t).timestamp()
+        dt = datetime.fromisoformat(text)
     except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _int_or_none(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
         return None
 
 
-def read_history(path):
+def _chart_rows(rows):
+    """Normalise a chart list to [{'uid', 'rank', 'playing'}...] keeping source order."""
+    out = []
+    if not isinstance(rows, list):
+        return out
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        uid = _int_or_none(row.get("universe_id"))
+        if uid is None:
+            continue
+        out.append({
+            "uid": uid,
+            "rank": _int_or_none(row.get("rank")),
+            "playing": _int_or_none(row.get("playing")),
+        })
+    return out
+
+
+def normalize_read(rec):
+    """One raw history record -> internal read dict, or None when unusable."""
+    if not isinstance(rec, dict):
+        return None
+    at = parse_ts(rec.get("at"))
+    rows = _chart_rows(rec.get("up_and_coming"))
+    if at is None or not rows:
+        return None
+    details = rec.get("details") if isinstance(rec.get("details"), dict) else {}
+    by_id = {}
+    for pos, row in enumerate(rows):
+        if row["uid"] not in by_id:
+            by_id[row["uid"]] = {
+                "rank": row["rank"],
+                "pos": pos,
+                "playing": row["playing"],
+            }
+    return {
+        "at": at,
+        "rows": rows,
+        "by_id": by_id,
+        "trending": _chart_rows(rec.get("top_trending")),
+        "playing_now": _chart_rows(rec.get("top_playing_now")),
+        "details": details,
+    }
+
+
+def load_history(path):
+    """Read history.ndjson into sorted, usable reads."""
     reads = []
-    with open(path, "r", encoding="utf-8") as fh:
-        for line in fh:
+    if not os.path.exists(path):
+        return reads
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
             line = line.strip()
             if not line:
                 continue
             try:
                 rec = json.loads(line)
-            except ValueError:
+            except Exception:
                 continue
-            if not isinstance(rec, dict):
-                continue
-            at = parse_ts(rec.get("at"))
-            chart = rec.get("up_and_coming")
-            if at is None or not isinstance(chart, list):
-                continue
-            order, playing, created = [], {}, {}
-            for row in chart:
-                if not isinstance(row, dict):
-                    continue
-                uid = row.get("universe_id")
-                if not isinstance(uid, int):
-                    continue
-                rank = row.get("rank")
-                if not isinstance(rank, int) or rank < 1:
-                    rank = len(order) + 1
-                order.append((rank, uid))
-                play = row.get("playing")
-                if isinstance(play, (int, float)):
-                    playing[uid] = float(play)
-            order.sort()
-            details = rec.get("details")
-            if isinstance(details, dict):
-                for key, det in details.items():
-                    if not isinstance(det, dict):
-                        continue
-                    try:
-                        uid = int(key)
-                    except (TypeError, ValueError):
-                        continue
-                    when = parse_ts(det.get("created"))
-                    if when:
-                        created[uid] = when
-            others = {}
-            for name in ("top_trending", "top_playing_now"):
-                rows = rec.get(name)
-                if not isinstance(rows, list):
-                    continue
-                for row in rows:
-                    if not isinstance(row, dict):
-                        continue
-                    uid, rank = row.get("universe_id"), row.get("rank")
-                    if isinstance(uid, int) and isinstance(rank, int) and rank > 0:
-                        others.setdefault(uid, []).append(rank)
-            ids = [uid for _, uid in order]
-            reads.append({
-                "t": at,
-                "ids": ids,
-                "rank": {uid: i + 1 for i, uid in enumerate(ids)},
-                "playing": playing,
-                "created": created,
-                "other": {uid: min(v) for uid, v in others.items() if v},
-            })
-    reads.sort(key=lambda r: r["t"])
+            read = normalize_read(rec)
+            if read is not None:
+                reads.append(read)
+    reads.sort(key=lambda r: r["at"])
     return reads
 
 
-def growth_of(reads, u):
-    """log growth of a game's players per 24h over the last two reads that list it."""
-    seen = []
-    for rec in reads[-6:]:
-        play = rec["playing"].get(u)
-        if play is not None:
-            seen.append((rec["t"], play))
-    if len(seen) < 2:
-        return 0.0
-    (t1, p1), (t0, p0) = seen[-1], seen[-2]
-    if not p0 or not p1:
-        return 0.0
-    hours = max(0.25, (t1 - t0) / 3600.0)
-    return math.log(p1 / p0) / hours * 24.0
-
-
-def factors(reads, u, last):
-    created = None
-    for rec in reversed(reads):
-        if u in rec["created"]:
-            created = rec["created"][u]
-            break
-    age = (last["t"] - created) / 86400.0 if created else 30.0
-    other = last["other"].get(u)
-    return {
-        "growth": max(-1.5, min(1.5, growth_of(reads, u))),
-        "logplay": math.log1p(last["playing"].get(u) or 0.0),
-        "age": min(60.0, age),
-        "other": math.log1p(other) if other else 0.0,
-    }
-
-
-def spread_stay_decay(hour):
-    f = max(0.0, min(1.0, hour / HORIZON)) ** 0.5
-    return (PARAMS["s0"] + PARAMS["s1"] * f,
-            PARAMS["st0"] + PARAMS["st1"] * f,
-            PARAMS["d0"] + PARAMS["d1"] * f)
-
-
-def forecast(reads, slots=SLOTS):
-    last = reads[-1]
-    cand = last["ids"][:PARAMS["cand"]]
-    feats = {u: factors(reads, u, last) for u in cand}
-    acc = {k: {} for k in range(1, PLACES + 1)}
-    for slot in range(slots):
-        spread, stay, decay = spread_stay_decay((slot + 1) * 3600.0)
-        for k in range(1, PLACES + 1):
-            w = {}
-            for u in cand:
-                f = feats[u]
-                dist = abs(last["rank"][u] - k)
-                v = math.exp(-dist / spread) + (stay if dist == 0 else 0.0)
-                v *= math.exp(PARAMS["w_growth"] * f["growth"]
-                              + PARAMS["w_logplay"] * (f["logplay"] - 8.5) / 2.0
-                              + PARAMS["w_age"] * (f["age"] - 20.0) / 20.0
-                              + PARAMS["w_other"] * (f["other"] - 3.0) / 2.0)
-                w[u] = v
-            total = sum(w.values()) or 1.0
-            for u, v in w.items():
-                acc[k][u] = acc[k].get(u, 0.0) + decay * v / total / slots
-    return acc, cand
-
-
-def main():
-    inp = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
-    out = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
+def load_task(path):
     task = {}
-    try:
-        with open(os.path.join(inp, "task.json"), "r", encoding="utf-8") as fh:
-            task = json.load(fh)
-    except (OSError, ValueError):
-        task = {}
-    places = int(task.get("places") or PLACES)
-    slots = int((task.get("window") or {}).get("slots") or SLOTS)
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict):
+                task = loaded
+        except Exception:
+            task = {}
 
-    reads = read_history(os.path.join(inp, "history.ndjson"))
+    places = _int_or_none(task.get("places"))
+    if places is None or places < 1:
+        places = 10
+    slots = None
+    window = task.get("window")
+    if isinstance(window, dict):
+        slots = _int_or_none(window.get("slots"))
+    if slots is None or slots < 1:
+        slots = 72
+    return {"places": places, "slots": slots}
+
+
+def ordered_chart(read):
+    """The read's up_and_coming order, sorted by rank when ranks are present."""
+    rows = read["rows"]
+    if any(row["rank"] is not None for row in rows):
+        return sorted(
+            rows,
+            key=lambda r: (r["rank"] if r["rank"] is not None else 10 ** 9),
+        )
+    return list(rows)
+
+
+def find_created(uid, reads, last_at):
+    """Days between last_at and the most recent known created timestamp."""
+    for read in reversed(reads):
+        entry = read["details"].get(str(uid))
+        if not isinstance(entry, dict):
+            continue
+        created = parse_ts(entry.get("created"))
+        if created is None:
+            continue
+        return min(AGE_CAP, (last_at - created).total_seconds() / 86400.0)
+    return AGE_DEFAULT
+
+
+def growth_of(uid, reads):
+    """Log player growth per 24h from the last two usable appearances."""
+    found = []
+    for read in reversed(reads[-GROWTH_LOOKBACK:]):
+        row = read["by_id"].get(uid)
+        if row is None:
+            continue
+        playing = row["playing"]
+        if playing is None or playing <= 0:
+            continue
+        found.append((read["at"], playing))
+        if len(found) == 2:
+            break
+    if len(found) < 2:
+        return 0.0
+    (at1, p1), (at0, p0) = found[0], found[1]
+    gap_hours = (at1 - at0).total_seconds() / 3600.0
+    g = math.log(p1 / p0) / max(0.25, gap_hours) * 24.0
+    return max(-1.5, min(1.5, g))
+
+
+def other_of(uid, last):
+    """ln(1 + best rank on top_trending / top_playing_now), 0 if absent."""
+    ranks = []
+    for rows in (last["trending"], last["playing_now"]):
+        for row in rows:
+            if row["uid"] == uid and row["rank"] is not None:
+                ranks.append(row["rank"])
+    if not ranks:
+        return 0.0
+    return math.log(1.0 + min(ranks))
+
+
+def build_candidates(reads):
+    last = reads[-1]
+    order = ordered_chart(last)[:CANDIDATES]
+    cands = []
+    for pos, row in enumerate(order):
+        uid = row["uid"]
+        rank = row["rank"] if row["rank"] is not None else pos + 1
+        playing = row["playing"] if row["playing"] is not None else 0
+        logplay = math.log(1.0 + max(0, playing))
+        age = find_created(uid, reads, last["at"])
+        g = growth_of(uid, reads)
+        other = other_of(uid, last)
+        factor = math.exp(
+            0.2 * g
+            + 0.1 * (logplay - 8.5)
+            - 0.02 * (age - 20.0)
+            - 0.15 * (other - 3.0)
+        )
+        cands.append({"uid": uid, "rank": rank, "factor": factor})
+    return cands
+
+
+def place_weights(cands, place, horizon_seconds):
+    u = min(1.0, max(0.0, horizon_seconds / HORIZON))
+    f = math.sqrt(u)
+    spread = 3.5 + 4.0 * f
+    stay = 1.0
+    decay = 0.8 - 0.05 * f
+
+    weights = []
+    for cand in cands:
+        rank = cand["rank"]
+        base = math.exp(-abs(rank - place) / spread)
+        if rank == place:
+            base += stay
+        weights.append(base * cand["factor"])
+
+    total = 0.0
+    for w in weights:
+        total += w
+    if total <= 0.0:
+        return [0.0] * len(cands)
+    return [decay * w / total for w in weights]
+
+
+def top10_of(last, reads):
+    """First 10 distinct ids of the last read's order, padded from that order /
+    from older reads only if it holds fewer than 10 distinct ids."""
+    ids = []
+    for read in [last] + [r for r in reversed(reads) if r is not last]:
+        for row in ordered_chart(read):
+            if row["uid"] not in ids:
+                ids.append(row["uid"])
+            if len(ids) >= 10:
+                return ids[:10]
+    return ids[:10]
+
+
+def forecast(task, reads):
+    """Compute the forecast dict from a usable, sorted read list."""
+    places = task["places"]
+    slots = task["slots"]
+
     if not reads:
-        raise SystemExit("no usable reads in the history")
+        return {"probabilities": [], "top10": []}
 
-    acc, cand = forecast(reads, slots)
+    cands = build_candidates(reads)
+    totals = [[0.0] * len(cands) for _ in range(places + 1)]
+
+    for slot in range(slots):
+        horizon = (slot + 1) * 3600.0
+        for place in range(1, places + 1):
+            probs = place_weights(cands, place, horizon)
+            acc = totals[place]
+            for i, p in enumerate(probs):
+                acc[i] += p
+
     probabilities = []
-    for k in range(1, places + 1):
-        rows = acc.get(k, {})
-        total = sum(rows.values())
-        for u in sorted(rows):
-            p = rows[u] if total <= 1.0 else rows[u] / total
-            # round downward: no place may sum above 1 once the rows are rounded
+    for place in range(1, places + 1):
+        acc = totals[place]
+        rows = []
+        for i, cand in enumerate(cands):
+            p = acc[i] / slots
+            if p <= 0.0:
+                continue
             p = math.floor(p * 1e9) / 1e9
-            probabilities.append({"universe_id": u, "place": k, "p": p})
-    top10 = cand[:places]
-    while len(top10) < places:
-        for u in reads[-1]["ids"]:
-            if u not in top10:
-                top10.append(u)
-                break
+            if p <= 0.0:
+                continue
+            rows.append({"universe_id": int(cand["uid"]), "place": int(place), "p": p})
+        rows.sort(key=lambda r: (-r["p"], r["universe_id"]))
+        probabilities.extend(rows[:MAX_ROWS_PER_PLACE])
 
-    os.makedirs(out, exist_ok=True)
-    with open(os.path.join(out, "forecast.json"), "w", encoding="utf-8") as fh:
-        json.dump({"probabilities": probabilities, "top10": top10}, fh,
-                  separators=(",", ":"), sort_keys=False)
-        fh.write("\n")
+    return {"probabilities": probabilities, "top10": [int(u) for u in top10_of(reads[-1], reads)]}
+
+
+def write_output(out_dir, payload):
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "forecast.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, separators=(",", ":"))
+    return path
 
 
 def selftest():
-    """Check the output contract on a synthetic history: no input files, no network."""
-    import tempfile
+    """Forecast a small synthetic history built in memory and assert the invariants."""
+    base = datetime(2026, 11, 1, 0, 0, tzinfo=timezone.utc)
     reads = []
     for step in range(3):
-        chart = [{"universe_id": 900000 + i, "rank": i + 1, "playing": 5000 + i * 40 + step * 10}
-                 for i in range(30)]
-        reads.append({"t": 1000.0 + step * 3600, "ids": [r["universe_id"] for r in chart],
-                      "rank": {r["universe_id"]: r["rank"] for r in chart},
-                      "playing": {r["universe_id"]: r["playing"] for r in chart},
-                      "created": {}, "other": {}})
-    acc, cand = forecast(reads, SLOTS)
-    assert len(cand) == min(PARAMS["cand"], 30)
-    for k, rows in acc.items():
-        assert 1 <= k <= PLACES
-        assert sum(rows.values()) <= 1.0 + 1e-12, (k, sum(rows.values()))
-    assert sorted(acc) == list(range(1, PLACES + 1))
-    with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, "forecast.json")
-        payload = {"probabilities": [{"universe_id": u, "place": k, "p": math.floor(p * 1e9) / 1e9}
-                                     for k, rows in sorted(acc.items()) for u, p in sorted(rows.items())],
-                   "top10": cand[:PLACES]}
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, separators=(",", ":"))
-        back = json.load(open(path, encoding="utf-8"))
-        by_place = {}
-        for row in back["probabilities"]:
-            by_place.setdefault(row["place"], []).append(row["p"])
-        for k, ps in by_place.items():
-            assert len(ps) <= 100 and 0.0 <= min(ps) and sum(ps) <= 1.0 + 1e-12
-        assert len(back["top10"]) == PLACES == len(set(back["top10"]))
+        at = base.replace(hour=step)
+        rows = []
+        for i in range(30):
+            uid = 9000000 + i
+            playing = 500 + 900 * i + 400 * step * (i % 4)
+            rows.append({"universe_id": uid, "rank": i + 1, "playing": playing})
+        details = {
+            str(9000000 + i): {
+                "created": "2026-09-{:02d}T00:00:00.000Z".format((i % 27) + 1),
+            }
+            for i in range(0, 30, 2)
+        }
+        trending = [{"universe_id": 9000000 + i, "rank": 40 - i} for i in range(0, 12)]
+        reads.append(normalize_read({
+            "at": at.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "up_and_coming": rows,
+            "top_trending": trending,
+            "top_playing_now": [{"universe_id": 9000029, "rank": 3}],
+            "details": details,
+        }))
+
+    task = load_task(os.path.join(os.sep, "nonexistent", "task.json"))
+    payload = forecast(task, reads)
+
+    places = sorted({row["place"] for row in payload["probabilities"]})
+    assert places == list(range(1, 11)), places
+
+    per_place = {p: 0.0 for p in range(1, 11)}
+    for row in payload["probabilities"]:
+        assert 0.0 <= row["p"] <= 1.0, row
+        per_place[row["place"]] += row["p"]
+    for place, total in per_place.items():
+        assert total <= 1.0 + 1e-12, (place, total)
+
+    top = payload["top10"]
+    assert len(top) == 10 and len(set(top)) == 10, top
+
     print("selftest ok")
 
 
-if __name__ == "__main__":
-    if "--selftest" in sys.argv[1:]:
+def main(argv):
+    if "--selftest" in argv:
         selftest()
-    else:
-        main()
+        return 0
+
+    in_dir = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
+
+    task = load_task(os.path.join(in_dir, "task.json"))
+    reads = load_history(os.path.join(in_dir, "history.ndjson"))
+    payload = forecast(task, reads)
+    write_output(out_dir, payload)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

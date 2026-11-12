@@ -1,6 +1,5 @@
-# roblox-up-and-coming-forecast-01
-
-Prediksi 10 besar chart Roblox "Up and Coming" (US/computer) untuk 72 jam setelah deadline: output `forecast.json` berisi `probabilities` (`universe_id` × `place` × `p`) plus `top10`.
-Jalankan lokal: `MAKEFUN_INPUT_DIR=../roblox-up-and-coming-forecast-01-kit/input MAKEFUN_OUTPUT_DIR=out python3 main.py`
-Uji kontrak output tanpa file input (histori sintetis, deterministik): `python3 main.py --selftest`
-Model: kernel difusi peringkat di sekitar posisi terakhir tiap game, dikali faktor pemain (growth, ukuran, umur, kehadiran di chart lain), dinormalkan per tempat lalu dikali decay horizon — stdlib saja, deterministik, <1 detik.
+# Roblox "Up and Coming" forecast (72h)
+Predicts `forecast.json`: for places 1..10, the probability that each of the last chart read's top-25 Up-and-Coming games ends up in that place, averaged over the 72 hourly slots after the deadline, plus a `top10` id list taken from the last read's chart order.
+Run locally with `mkdir -p out && MAKEFUN_INPUT_DIR=path/to/input MAKEFUN_OUTPUT_DIR=out python3 main.py` (env defaults are `/input` and `/output`; it reads `task.json` and `history.ndjson`, writes `out/forecast.json` in a few seconds, byte-identical across runs).
+`python3 main.py --selftest` forecasts a small synthetic in-memory history (30 games, 3 reads an hour apart) and prints `selftest ok` after checking places 1..10, per-place probability sums <= 1 and 10 distinct top10 ids.
+Model: a rank-diffusion weight (`exp(-|rank-k|/spread)` plus an on-diagonal stay bonus, with `spread` and `decay` widening over the horizon) times a per-game factor from log player growth, log current players, age and trending/playing-now presence, normalised per place — standard library only, no clock, no randomness.
