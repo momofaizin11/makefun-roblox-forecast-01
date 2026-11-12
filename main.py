@@ -35,6 +35,36 @@ PM = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.85, 1.0, 0.85, 0.85]   # per-place mass ca
 DECAY0 = 0.86
 DECAY1 = -0.05
 
+# --- p4 model constants, ported verbatim from work/params_p4.json -----------
+# Blend of an empirical rank->place transition table (alpha), a game-identity
+# occupancy prior (beta) and the v4 parametric kernel (rest), times the p2
+# 16-feature factor. See work/p4.py and work/core_p3.py.
+P4_KN = [1.55, 1.55, 0.6777, 0.5305, 0.3189, 0.3189, 0.2551, 0.044, 0.0024, 0.0024, 0.0]
+P4_KF = [2.975, 0.8752, 0.8752, 0.6703, 0.5866, 0.5866, 0.5617, 0.3932, 0.2753, 0.2753, 0.2203]
+P4_W = [0.1, -0.05, -0.6, -0.3, 0.2, -0.65,
+        0.0, 0.0, 0.0, 0.3, 0.0, -0.15, 0.0, 0.05, 0.0, -0.05]
+P4_CENTRE = [0.0, 0.0, 5.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+             2.0, 0.3, 0.3, 2.0]
+P4_SCALE = [1.0, 2.0, 5.0, 2.0, 1.0, 3.0, 2.0, 2.0, 2.0, 0.5, 0.5, 0.5,
+            2.0, 0.3, 0.3, 1.5]
+P4_D0 = 0.86
+P4_D1 = -0.08
+P4_CAND = 30
+P4_PM = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.85, 1.0, 0.85, 0.85]
+P4_MK = 18
+P4_ALPHA = 0.3
+P4_BETA = 0.2
+P4_LAM = 3.0
+P4_OCC_TAU_H = 12.0
+P4_KC = 8.0
+P4_RMAX = 45                       # cap on the rank index used by the table
+P4_SLOTS = 8                       # sub-slot approximation (shipped)
+P4_BUCKET_H = ((0.0, 6.0), (6.0, 18.0), (18.0, 36.0), (36.0, 54.0), (54.0, 80.0))
+P4_MAX_LAG_H = 80.0
+P4_CHARTS = ("explore:top-trending", "explore:top-playing-now",
+             "explore:top-revisited", "explore:fun-with-friends")
+P2_MOM_WINDOWS = ((6.0, 1.0), (18.0, 0.5))
+
 
 def parse_ts(value):
     """ISO-8601 (with Z or offset) -> aware UTC datetime, or None."""
@@ -361,6 +391,365 @@ def forecast(task, reads):
     return {"probabilities": probabilities, "top10": [int(u) for u in top10_of(reads[-1], reads)]}
 
 
+# --- p4 model (ported from work/p4.py + work/core_p3.py + work/p2.py) -------
+# One forecaster per (place, sub-slot): a blend of an empirical rank->place
+# transition table, a game-identity occupancy prior and the v4 kernel, times the
+# p2 16-feature factor.  Everything is causal (built only from reads before the
+# anchor) and null-tolerant: a missing feature degrades to its neutral default.
+
+def p4_bucket_of_h(hours):
+    """Lag bucket index for a lag in hours (core_p3.bucket_of_h)."""
+    for b, (lo, hi) in enumerate(P4_BUCKET_H):
+        if lo <= hours < hi:
+            return b
+    return len(P4_BUCKET_H) - 1
+
+
+def p4_read_map(read):
+    """A normalised read -> {t, uc, rank, playing, other} with positions as ranks."""
+    order = ordered_chart(read)
+    rank = {}
+    playing = {}
+    uc = []
+    for pos, row in enumerate(order):
+        uid = row["uid"]
+        if uid in rank:
+            continue
+        r = row["rank"]
+        if not isinstance(r, int) or r < 1:
+            r = pos + 1
+        rank[uid] = r
+        p = row["playing"]
+        playing[uid] = p if isinstance(p, int) and p > 0 else 0
+        uc.append(uid)
+    other = {}
+    for chart, rows in (("explore:top-trending", read["trending"]),
+                        ("explore:top-playing-now", read["playing_now"])):
+        for pos, row in enumerate(rows):
+            uid = row["uid"]
+            r = row["rank"]
+            if not isinstance(r, int) or r < 1:
+                r = pos + 1
+            other.setdefault(uid, {})[chart] = r
+    return {"t": read["at"].timestamp(), "uc": uc, "rank": rank,
+            "playing": playing, "other": other}
+
+
+def p4_created(maps):
+    """uid -> timestamp of its earliest appearance in the history."""
+    created = {}
+    for m in maps:
+        for u in m["uc"]:
+            created.setdefault(u, m["t"])
+    return created
+
+
+def p4_rank_before(maps, i, uid, hours):
+    """Rank of uid in the newest read at least `hours` older than read i."""
+    t = maps[i]["t"]
+    for j in range(i - 1, max(-1, i - 48), -1):
+        if t - maps[j]["t"] >= hours * 3600.0:
+            return maps[j]["rank"].get(uid)
+    return None
+
+
+def p4_growth_win(maps, i, uid, lo_h, maxk=18):
+    """Daily playing log-growth using the newest reference at least lo_h old."""
+    ser = []
+    for k in range(max(0, i - maxk), i + 1):
+        if uid in maps[k]["playing"]:
+            ser.append((maps[k]["t"], maps[k]["playing"][uid]))
+    if len(ser) < 2:
+        return 0.0
+    t1, p1 = ser[-1]
+    if not p1:
+        return 0.0
+    for t0, p0 in reversed(ser[:-1]):
+        if p0 and (t1 - t0) >= lo_h * 3600.0:
+            return math.log(p1 / p0) / ((t1 - t0) / 3600.0) * 24.0
+    return 0.0
+
+
+def p4_rank_series(maps, i, uid, maxk=18):
+    out = []
+    for k in range(max(0, i - maxk), i + 1):
+        r = maps[k]["rank"].get(uid)
+        if r:
+            out.append((maps[k]["t"], r))
+    return out
+
+
+def p4_feats(maps, created, i, uid):
+    """The 16 p2 features for one game at read i (mirrors core10.Data/p2.Data)."""
+    s = maps[i]
+    r_now = s["rank"].get(uid)
+    # growth over a >=6h window (core10.Data.feats)
+    ser = []
+    for k in range(max(0, i - 10), i + 1):
+        if uid in maps[k]["playing"]:
+            ser.append((maps[k]["t"], maps[k]["playing"][uid]))
+    g21 = 0.0
+    if len(ser) >= 2:
+        t1, p1 = ser[-1]
+        ref = None
+        for t0, p0 in reversed(ser[:-1]):
+            if p0 and (t1 - t0) >= 6 * 3600.0:
+                ref = (t0, p0)
+                break
+        if ref is None:
+            ref = ser[0]
+        t0, p0 = ref
+        if p0 and p1:
+            dt = max(1.0, (t1 - t0) / 3600.0)
+            g21 = math.log(p1 / p0) / dt * 24.0
+    growth = max(-1.5, min(1.5, g21))
+    # days since first seen (capped at 10)
+    c = created.get(uid)
+    age = min(10.0, (s["t"] - c) / 86400.0) if c is not None else 10.0
+    # best rank over the other public charts
+    others = [v for v in s["other"].get(uid, {}).values() if v]
+    other = math.log1p(min(others)) if others else 0.0
+    # rank momentum over the 6h / 18h windows
+    mom = 0.0
+    if r_now is not None:
+        for hours, scale in P2_MOM_WINDOWS:
+            pr = p4_rank_before(maps, i, uid, hours)
+            if pr:
+                mom += scale * (pr - r_now) / 5.0
+    momentum = max(-2.0, min(2.0, mom))
+    # log playing relative to the chart's median
+    plays = [p for p in s["playing"].values() if p]
+    med = statistics.median(plays) if plays else 0
+    logplay = math.log1p(s["playing"].get(uid) or 0) - (math.log1p(med) if med else 0.0)
+    # rank if the chart were ordered by playing
+    order = sorted(s["rank"], key=lambda x: -(s["playing"].get(x) or 0))
+    pr = order.index(uid) + 1 if uid in order else 50
+    playrank = max(-3.0, min(3.0, (pr - 25) / 25.0))
+    # rank lags (frozen at w=0, computed for fidelity)
+    def lag(hours):
+        pr = p4_rank_before(maps, i, uid, hours)
+        if pr is None or r_now is None:
+            return 0.0
+        return max(-6.0, min(6.0, pr - r_now))
+    lag12, lag24, lag48 = lag(12.0), lag(24.0), lag(48.0)
+    # longer-window playing growth + acceleration
+    g24 = max(-1.5, min(1.5, p4_growth_win(maps, i, uid, 18.0)))
+    g48 = max(-1.5, min(1.5, p4_growth_win(maps, i, uid, 36.0)))
+    accel = max(-1.5, min(1.5, g24 - g48))
+    # rank volatility over the last <=48h
+    rs = [(t, r) for t, r in p4_rank_series(maps, i, uid) if t >= s["t"] - 48 * 3600.0]
+    vol = 0.0
+    if len(rs) >= 3:
+        vol = min(6.0, statistics.pstdev([r for _, r in rs]))
+    other_map = s["other"].get(uid, {})
+
+    def rankok(chart):
+        r = other_map.get(chart)
+        return (51 - min(r, 51)) / 50.0 if r else 0.0
+
+    trendok = rankok("explore:top-trending")
+    playok = rankok("explore:top-playing-now")
+    ncharts = float(1 + sum(1 for ch in P4_CHARTS if other_map.get(ch)))
+    return (growth, logplay, age, other, momentum, playrank,
+            lag12, lag24, lag48, g24, g48, accel, vol, trendok, playok, ncharts)
+
+
+def p4_factor(f):
+    """p2 factor: exp(clamp(sum w[i]/scale[i]*(f[i]-centre[i]), -4, 4))."""
+    x = 0.0
+    for i in range(16):
+        x += (P4_W[i] / P4_SCALE[i]) * (f[i] - P4_CENTRE[i])
+    return math.exp(max(-4.0, min(4.0, x)))
+
+
+def p4_table(maps, upto):
+    """Empirical P(place | rank, lag bucket) from read pairs strictly before `upto`."""
+    nb = len(P4_BUCKET_H)
+    cnt = [[[0.0] * 11 for _ in range(P4_RMAX + 1)] for _ in range(nb)]
+    for j in range(upto):
+        sj = maps[j]
+        for jp in range(j + 1, upto):
+            dh = (maps[jp]["t"] - sj["t"]) / 3600.0
+            if dh <= 0.0 or dh > P4_MAX_LAG_H:
+                continue
+            b = p4_bucket_of_h(dh)
+            ranks_p = maps[jp]["rank"]
+            for u, r in sj["rank"].items():
+                rr = r if r < P4_RMAX else P4_RMAX
+                rp = ranks_p.get(u)
+                col = rp if (rp is not None and rp <= 10) else 0
+                cnt[b][rr][col] += 1.0
+    marg = []
+    for b in range(nb):
+        m = [0.0] * 11
+        for r in range(P4_RMAX + 1):
+            row = cnt[b][r]
+            for k in range(11):
+                m[k] += row[k]
+        tot = sum(m) or 1.0
+        marg.append([x / tot for x in m])
+    return {"cnt": cnt, "marg": marg}
+
+
+def p4_prob(table, b, r, k, lam):
+    """P(place k | rank r, bucket b) with Dirichlet shrinkage toward the marginal."""
+    r = min(max(1, r), P4_RMAX)
+    row = table["cnt"][b][r]
+    tot = sum(row)
+    prior = table["marg"][b][k]
+    return (row[k] + lam * prior) / (tot + lam)
+
+
+def p4_occ(maps, upto, tau_h):
+    """Time-decayed count of past top-10 occupancy per game per place (before `upto`)."""
+    occ = {}
+    ti = maps[upto]["t"]
+    for j in range(upto):
+        dt = (ti - maps[j]["t"]) / 3600.0
+        w = math.exp(-dt / tau_h)
+        if w < 1e-4:
+            continue
+        for u, r in maps[j]["rank"].items():
+            if r <= 10:
+                occ.setdefault(u, [0.0] * 11)[r] += w
+    return occ
+
+
+def forecast_p4(task, reads):
+    """The p4 forecast dict; raises on anything the caller should fall back from."""
+    places = task["places"]
+    if places != 10 or len(reads) < 2:
+        raise ValueError("p4 needs 10 places and at least 2 reads")
+    i = len(reads) - 1
+    maps = [p4_read_map(r) for r in reads]
+    created = p4_created(maps)
+    s = maps[i]
+    cand = s["uc"][:P4_CAND]
+    if not cand:
+        raise ValueError("no candidates")
+    table = p4_table(maps, i)
+    occ = p4_occ(maps, i, P4_OCC_TAU_H)
+    n = i
+    a_eff = P4_ALPHA * (n / (n + P4_KC)) if n > 0 else 0.0
+    F = {u: p4_factor(p4_feats(maps, created, i, u)) for u in cand}
+    slots = P4_SLOTS
+    acc = {k: {} for k in range(1, places + 1)}
+    for slot in range(slots):
+        h = (slot + 0.5) / slots * HORIZON_H
+        f = math.sqrt(min(1.0, max(0.0, h / HORIZON_H)))
+        b = p4_bucket_of_h(h)
+        decay = P4_D0 + P4_D1 * f
+        for k in range(1, places + 1):
+            tocc = 0.0
+            for u in cand:
+                e = occ.get(u)
+                if e is not None:
+                    tocc += e[k]
+            w = {}
+            for u in cand:
+                r = s["rank"][u]
+                dd = min(abs(r - k), 10)
+                kv4 = P4_KN[dd] + (P4_KF[dd] - P4_KN[dd]) * f
+                pemp = p4_prob(table, b, r, k, P4_LAM)
+                e = occ.get(u)
+                pocc = (e[k] / tocc) if (e is not None and tocc > 0.0) else 0.0
+                kern = a_eff * pemp + P4_BETA * pocc + (1.0 - a_eff - P4_BETA) * kv4
+                w[u] = kern * F[u]
+            top = dict(sorted(w.items(), key=lambda kv: -kv[1])[:P4_MK]) if P4_MK < len(w) else w
+            tot = sum(top.values()) or 1.0
+            scale = min(1.0, decay * P4_PM[k - 1]) / slots
+            for u, v in top.items():
+                acc[k][u] = acc[k].get(u, 0.0) + scale * v / tot
+    probabilities = []
+    for k in range(1, places + 1):
+        rows = []
+        for u, p in acc[k].items():
+            if p <= 0.0:
+                continue
+            rows.append({"universe_id": int(u), "place": int(k),
+                         "p": math.floor(p * 1e9) / 1e9})
+        rows.sort(key=lambda r: (-r["p"], r["universe_id"]))
+        probabilities.extend(rows[:MAX_ROWS_PER_PLACE])
+    return {"probabilities": probabilities,
+            "top10": [int(u) for u in top10_of(reads[-1], reads)]}
+
+
+def payload_sane(payload):
+    """The p4 output must satisfy the schema and the format sanity checks."""
+    if not isinstance(payload, dict):
+        return False
+    probs = payload.get("probabilities")
+    top = payload.get("top10")
+    if not isinstance(probs, list) or not isinstance(top, list):
+        return False
+    sums = {}
+    for row in probs:
+        if not isinstance(row, dict):
+            return False
+        uid = row.get("universe_id")
+        place = row.get("place")
+        p = row.get("p")
+        if isinstance(uid, bool) or not isinstance(uid, int):
+            return False
+        if isinstance(place, bool) or not isinstance(place, int):
+            return False
+        if isinstance(p, bool) or not isinstance(p, (int, float)):
+            return False
+        if p != p or p < 0.0:            # NaN or negative
+            return False
+        if not 1 <= place <= 10:
+            return False
+        sums[place] = sums.get(place, 0.0) + float(p)
+    if set(sums) != set(range(1, 11)):
+        return False
+    for tot in sums.values():
+        if tot > 1.0 + 1e-9:
+            return False
+    if len(top) < 10:
+        return False
+    for u in top:
+        if isinstance(u, bool) or not isinstance(u, int):
+            return False
+    return True
+
+
+def emergency_forecast(task, reads):
+    """Last-resort valid payload: the last read's top ids, 0.1 each at every place."""
+    ids = []
+    if reads:
+        try:
+            rows = ordered_chart(reads[-1])
+        except Exception:
+            rows = []
+        for row in rows:
+            if row["uid"] not in ids:
+                ids.append(row["uid"])
+            if len(ids) >= 10:
+                break
+    while len(ids) < 10:
+        ids.append(1000000 + len(ids))
+    probs = [{"universe_id": int(ids[place - 1]), "place": place, "p": 0.1}
+             for place in range(1, 11)]
+    return {"probabilities": probs, "top10": [int(u) for u in ids[:10]]}
+
+
+def build_forecast(task, reads):
+    """p4 when it validates, else the unchanged v4 path, else a trivial valid payload."""
+    try:
+        payload = forecast_p4(task, reads)
+        if payload_sane(payload):
+            return payload
+    except Exception:
+        pass
+    try:
+        payload = forecast(task, reads)
+        if payload_sane(payload):
+            return payload
+    except Exception:
+        pass
+    return emergency_forecast(task, reads)
+
+
 def write_output(out_dir, payload):
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, "forecast.json")
@@ -404,6 +793,22 @@ def selftest():
     top = payload["top10"]
     assert len(top) == 10 and len(set(top)) == 10, top
 
+    # --- the p4 path must satisfy the same invariants ---
+    p4_payload = forecast_p4(task, reads)
+    assert payload_sane(p4_payload), "p4 payload failed its sanity check"
+    assert sorted({row["place"] for row in p4_payload["probabilities"]}) == list(range(1, 11))
+    per_place = {p: 0.0 for p in range(1, 11)}
+    for row in p4_payload["probabilities"]:
+        assert 0.0 <= row["p"] <= 1.0, row
+        per_place[row["place"]] += row["p"]
+    for place, total in per_place.items():
+        assert total <= 1.0 + 1e-9, (place, total)
+    assert len(p4_payload["top10"]) == 10
+    # the dispatcher picks p4 here and still returns a sane payload
+    chosen = build_forecast(task, reads)
+    assert payload_sane(chosen), "build_forecast produced an insane payload"
+    assert chosen == p4_payload, "build_forecast should prefer the p4 path"
+
     print("selftest ok")
 
 
@@ -417,7 +822,7 @@ def main(argv):
 
     task = load_task(os.path.join(in_dir, "task.json"))
     reads = load_history(os.path.join(in_dir, "history.ndjson"))
-    payload = forecast(task, reads)
+    payload = build_forecast(task, reads)
     write_output(out_dir, payload)
     return 0
 
